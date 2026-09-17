@@ -1,0 +1,31 @@
+{
+  "id": "jouzu",
+  "protocol": 0,
+  "command": [
+    "node",
+    "jouzu-adapter.cjs"
+  ],
+  "runtime": {
+    "package": "jouzu",
+    "version": "0.1.10",
+    "command": [
+      "node",
+      "runtime/dist/cli.js"
+    ]
+  },
+  "extensions": [
+    "agent-presets",
+    "plan"
+  ],
+  "capabilities": [
+    "models",
+    "presets",
+    "plan",
+    "review",
+    "fork",
+    "stats",
+    "compact",
+    "rename",
+    "skills"
+  ]
+}
