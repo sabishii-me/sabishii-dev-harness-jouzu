@@ -1,3 +1,4 @@
+import { approvalContext } from "./approval-context.mjs";
 // agent-presets — a harness-side extension that gives a harness a preset
 // mechanism it lacks natively (pi/jouzu).
 //
@@ -8,16 +9,15 @@
 //   - tools         → allow-list; a tool_call outside it is blocked
 //   - approve       → ask before every tool call (the user answers in the hub)
 //
-// "approve" IS the approval capability: a preset that sets it makes the
-// harness ask before each tool. There is no separate approval plugin and no
-// approval switch — approval is a property of the preset a session selected.
+// A preset can enable approval initially. The explicit /review control can
+// enable or disable it later; loading the extension alone does not enable it.
 //
 // The definition file is JSON:
 //   { "active": "<preset-id>",
 //     "presets": { "<id>": { systemPrompt?, tools?[], approve? } } }
 //
-// When the file is absent, the extension is inert (no preset → no effect),
-// so installing it without a definition changes nothing.
+// Without a definition, no preset policy is applied and review starts off.
+// The explicit /review command is still registered when this extension is loaded.
 import fs from "node:fs";
 
 const CONFIG_ENV = "AGENT_PRESETS_CONFIG";
@@ -35,14 +35,12 @@ function activePreset() {
 }
 
 export default function agentPresets(pi) {
-  const preset = activePreset();
-  if (!preset) {
-    // No definition (or no active preset): stay inert. Nothing is claimed.
-    return;
-  }
+  // Hub installation exposes the explicit review control; merely loading it
+  // never enables approval. A selected preset may provide an initial policy.
+  const preset = activePreset() || {};
 
   const allowed = Array.isArray(preset.tools) && preset.tools.length ? new Set(preset.tools) : null;
-  const presetId = readConfig().active;
+  const presetId = readConfig()?.active ?? null;
 
   if (typeof preset.systemPrompt === "string" && preset.systemPrompt.trim()) {
     pi.on("before_agent_start", async () => ({ systemPrompt: preset.systemPrompt }));
@@ -60,24 +58,35 @@ export default function agentPresets(pi) {
   const review = { on: preset.approve === true };
   const FIELD = "hub-review/state";
 
-  if (allowed || preset.approve) {
+  {
     pi.on("tool_call", async (event, ctx) => {
       const name = event && event.toolName;
       if (typeof name === "string" && name && allowed && !allowed.has(name)) {
         return { block: true, reason: `tool '${name}' is not enabled in preset '${presetId}'` };
       }
-      if (preset.approve && review.on) {
-        const title = "Permission Required";
-        const message = `Allow ${name}?`;
-        const ok = await ctx.ui.confirm(title, message);
-        if (!ok) return { block: true, reason: `tool '${name}' was not approved` };
+      const policy = { event, blocks: [] };
+      pi.events.emit("tool-policy/preflight", policy);
+      if (policy.blocks.length) return { block: true, reason: policy.blocks.join("; ") };
+      if (review.on) {
+        const context = await approvalContext(event, ctx.cwd);
+        // Input's string result preserves a structured decision; confirm's boolean
+        // cannot distinguish an expired request from an explicit human denial.
+        const raw = await ctx.ui.input("tool-review/v2", JSON.stringify(context));
+        let decision;
+        try { decision = JSON.parse(raw || "null"); } catch {}
+        const source = decision?.source;
+        pi.appendEntry("hub-review/decision", { toolCallId: event.toolCallId, source: source || "unavailable", approved: decision?.approved === true, at: new Date().toISOString() });
+        if (decision?.approved === true && source === "user") return;
+        if (source === "timeout") return { block: true, reason: `Approval timed out for '${name}'; no user decision was received. This is NOT a user rejection. Do not automatically retry this operation.` };
+        if (source === "user") return { block: true, reason: `The user explicitly denied this '${name}' operation.` };
+        return { block: true, reason: `Approval could not be obtained for '${name}'. No user rejection was recorded; do not automatically retry.` };
       }
     });
   }
 
-  // The runtime switch. Registered only for a preset that asks at all, so a
-  // preset without review neither asks nor advertises a switch for it.
-  if (preset.approve) {
+  // The runtime switch is explicit and available whenever the hub installed
+  // this extension. It does not enable approval until requested.
+  {
     pi.registerCommand("review", {
       description: "Ask before every tool call, or stop asking with '/review off'",
       handler: async (rawArgs, ctx) => {
@@ -99,7 +108,6 @@ export default function agentPresets(pi) {
 
   // A resumed session comes back in the mode it left in: the newest record wins.
   pi.on("session_start", async (_event, ctx) => {
-    if (!preset.approve) return;
     try {
       const last = ctx.sessionManager
         .getEntries()

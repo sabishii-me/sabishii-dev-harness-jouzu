@@ -117,7 +117,7 @@ export default function hubPlan(pi) {
 
   // A plan turn must not change the tree: refuse a write command outright
   // rather than letting it run and be regretted.
-  pi.on("tool_call", async (event) => {
+  function checkPlanTool(event) {
     if (!enabled.value) return undefined;
     const name = String(event && event.toolName ? event.toolName : "").toLowerCase();
     if (WRITE_TOOLS.includes(name)) {
@@ -130,6 +130,13 @@ export default function hubPlan(pi) {
       }
     }
     return undefined;
+  }
+
+  pi.on("tool_call", async (event) => checkPlanTool(event));
+  // Shared preflight: the plan policy remains owned here, not copied into review.
+  pi.events.on("tool-policy/preflight", (request) => {
+    const result = checkPlanTool(request.event);
+    if (result?.block) request.blocks.push(result.reason);
   });
 
   // Tell the model what mode it is in, so it plans rather than attempting the

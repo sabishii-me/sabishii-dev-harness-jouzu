@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+const { enrichHistory } = require("./history-content.cjs");
 'use strict';
 // jouzu agent adapter — the ONLY place in the shell that knows jouzu exists.
 //
@@ -244,8 +245,12 @@ function installPlanExt(cwd) { return placeExtension('plan', cwd); }
 // up as null instead of echoing the request back as success.
 function planCommand(active, cb) {
   if (!pi) { cb(null); return; }
-  piRequest({ type: 'prompt', message: active ? '/plan' : '/plan off' })
-    .then((r) => {
+  piRequest({ type: 'get_commands' })
+    .then(r => {
+      if (!r?.success || !r.data?.commands?.some(c => c.name === 'plan')) throw new Error('plan extension is not loaded');
+      return piRequest({ type: 'prompt', message: active ? '/plan' : '/plan off' });
+    })
+    .then(r => {
       if (!r || r.success === false) { cb(null); return; }
       readPlanState(cb);
     })
@@ -261,28 +266,19 @@ function planCommand(active, cb) {
 // before giving up: the switch is a control action, and reporting "no capability"
 // because the harness was still booting would be wrong.
 function reviewCommand(on, cb) {
-  // cb(state): a boolean we OBSERVED, or 'unknown' when we could not observe one
-  // (no harness, a refusal, or the retries ran out). 'unknown' must never be
-  // reported to the caller as the value that was requested.
-  if (!pi) { cb('unknown'); return; }
-  let tries = 0;
-  const attempt = () => {
-    if (!pi) { cb('unknown'); return; }
-    piRequest({ type: 'prompt', message: on ? '/review on' : '/review off' })
-      .then((r) => {
-        if (!r || r.success === false) {
-          if (r && r.error) { cb('unknown'); return; }   // a real refusal, not a boot race
-          if (tries++ < 20) { setTimeout(attempt, 250); return; }
-          cb('unknown'); return;
-        }
-        readReviewState(cb);
-      })
-      .catch(() => {
-        if (tries++ < 20) { setTimeout(attempt, 250); return; }
-        cb('unknown');
-      });
-  };
-  attempt();
+  // A missing extension command must never fall through to a provider prompt.
+  harnessUpProof(120000)
+    .then(() => piRequest({ type: 'get_commands' }))
+    .then((r) => {
+      const commands = r && r.success === true && Array.isArray(r.data?.commands) ? r.data.commands : [];
+      if (!commands.some((c) => c.name === 'review')) throw new Error('review extension is not loaded');
+      return piRequest({ type: 'prompt', message: on ? '/review on' : '/review off' });
+    })
+    .then((r) => {
+      if (!r || r.success !== true) throw new Error('review command was rejected');
+      readReviewState((state) => typeof state === 'boolean' ? cb(state) : cb(null, new Error('review state was not recorded')));
+    })
+    .catch((error) => cb(null, error));
 }
 
 
@@ -433,6 +429,11 @@ function startPi(resumeRef) {
   }
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
   const ref = resumeRef || path.join(SESSIONS_DIR, `session-${Date.now()}-${process.pid}.jsonl`);
+  // The harness initializes an explicitly supplied empty file with its own
+  // valid header and persists subsequent entries even before a model turn.
+  // Never create a file on resume: missing existing references must fail.
+  if (!resumeRef) fs.closeSync(fs.openSync(ref, 'wx'));
+
   const args = [...piRuntime.args, 'pi', '--mode', 'rpc', '--session', ref, '--session-dir', SESSIONS_DIR, '--approve'];
   // Skills: the hub installs them and hands over the directory; --no-skills turns
   // off the harness's own discovery so the user's own skill directories stay out of
@@ -441,6 +442,8 @@ function startPi(resumeRef) {
   const env = { ...process.env };
   // A session preset: install the agent-presets extension into the workspace
   // and hand it the definition file it reads.
+  // Place only the extension the hub installed, before the child discovers it.
+  if (process.env.AGENT_HUB_CWD) installAgentPresetsExt(process.env.AGENT_HUB_CWD);
   if (activePresetId !== null) {
     const wcwd = process.env.AGENT_HUB_CWD || undefined;
     if (wcwd) { installAgentPresetsExt(wcwd); env.AGENT_PRESETS_CONFIG = writeActivePreset(wcwd, activePresetId); }
@@ -511,15 +514,31 @@ function handlePiMessage(msg) {
   if (msg.type === 'extension_ui_request') {
     const reqId = msg.id;
     if (process.env.AGENT_HUB_DIALOG_TRACE) process.stderr.write(`[jouzu-adapter] dialog method=${msg.method} id=${reqId} title=${JSON.stringify(msg.title ?? msg.params?.title ?? '')}\n`);
-    if (msg.method === 'confirm') {
+    const structuredReview = msg.method === 'input' && (msg.title ?? msg.params?.title) === 'tool-review/v2';
+    if (msg.method === 'confirm' || structuredReview) {
+      let reviewContext;
+      if (structuredReview || (msg.title ?? msg.params?.title) === 'tool-review/v1') {
+        try {
+          const value = JSON.parse(msg.message ?? msg.params?.message ?? msg.placeholder ?? '');
+          if (value.schema === 'tool-review/v1' && typeof value.tool === 'string' && typeof value.cwd === 'string') reviewContext = value;
+        } catch {}
+        if (!reviewContext) {
+          pi.stdin.write(JSON.stringify({ type: 'extension_ui_response', id: reqId, confirmed: false }) + String.fromCharCode(10));
+          return;
+        }
+      }
       // Map to the bus approval: the core answers {approved}, deadline-denied.
       pendingApprovals.set(reqId, (ans) => {
-        pi.stdin.write(JSON.stringify({ type: 'extension_ui_response', id: reqId, confirmed: ans.approved === true }) + '\n');
+        const response = structuredReview
+          ? { type: 'extension_ui_response', id: reqId, value: JSON.stringify({ approved: ans.approved === true, source: ans.reason === 'timeout' ? 'timeout' : ['allowed', 'denied'].includes(ans.reason) ? 'user' : 'unavailable' }) }
+          : { type: 'extension_ui_response', id: reqId, confirmed: ans.approved === true };
+        pi.stdin.write(JSON.stringify(response) + String.fromCharCode(10));
       });
       send({
         jsonrpc: '2.0', id: `appr-${reqId}`, method: 'approval_need',
         params: {
           kind: 'confirm',
+          ...(reviewContext ? { tool: reviewContext.tool, args: reviewContext } : {}),
           // pi's rpc dialog fields sit at the TOP level (rpc-mode emits
           // { method, title, message }), not under `params`. Read both shapes.
           detail: `${msg.title ?? msg.params?.title ?? ''} ${msg.message ?? msg.params?.message ?? ''}`.trim(),
@@ -617,13 +636,13 @@ function handlePiMessage(msg) {
   if (ev.type === 'tool_execution_start') {
     const args = ev.args;
     const detail = typeof args?.command === 'string' ? args.command : JSON.stringify(args ?? {}).slice(0, 120);
-    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'tool_started', tool: ev.toolName ?? '', toolCallId: ev.toolCallId ?? null, detail } } });
+    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'tool_started', tool: ev.toolName ?? '', toolCallId: ev.toolCallId ?? null, args: args ?? {}, detail } } });
     return;
   }
   if (ev.type === 'tool_execution_end') {
     const ok = ev.isError !== true;
     const result = typeof ev.result === 'string' ? ev.result : (ev.result === undefined ? '' : JSON.stringify(ev.result));
-    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'tool_end', tool: ev.toolName ?? '', toolCallId: ev.toolCallId ?? null, detail: result.slice(0, 400), ok } } });
+    send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'tool_end', tool: ev.toolName ?? '', toolCallId: ev.toolCallId ?? null, detail: result.slice(0, 400), result: ev.result, ok } } });
     return;
   }
   if (ev.type === 'session_info_changed') {
@@ -1072,7 +1091,8 @@ function handleBusMessage(msg) {
         const rcwd = process.env.AGENT_HUB_CWD;
         if (rcwd) installAgentPresetsExt(rcwd);
         pendingCount += 1;
-        reviewCommand(review === true, (state) => {
+        reviewCommand(review === true, (state, error) => {
+          if (error) { reply({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message, data: { code: 'review-not-applied' } } }); return; }
           // Only an OBSERVED state is reported as applied. 'unknown' means we
           // could not see the switch take effect (no harness, a refusal, or the
           // read never landed) — that must not read as success.
@@ -1329,7 +1349,7 @@ function handleBusMessage(msg) {
       // A forked (or externally created) session has history this adapter never
       // wrote down: import it before answering, or the page is a lie of omission.
       ensureTranscript(currentRef).catch((e) => process.stderr.write('[adapter] transcript import failed: ' + e.message)).then(() => {
-      const entries = loadTranscript(currentRef);
+      const entries = enrichHistory(currentRef, loadTranscript(currentRef));
       const limit = Math.max(1, Number(params.limit) || 20);
       let end = entries.length;
       if (params.beforeId !== undefined && params.beforeId !== null) {
@@ -1341,9 +1361,9 @@ function handleBusMessage(msg) {
         end = idx;
       }
       const start = Math.max(0, end - limit);
-      const page = entries.slice(start, end).map((e) => ({ id: e.id, role: e.role, text: e.text, complete: true }));
+      const page = entries.slice(start, end).map((e) => ({ ...e, complete: true }));
       send({ jsonrpc: '2.0', id, result: { messages: page, hasMore: start > 0 } });
-      });
+      }).catch(e => send({ jsonrpc: '2.0', id, error: { code: -32000, message: e.message } }));
       return;
     }
     // runtime/prepare: materialise the harness this plugin drives. The manifest pins it
