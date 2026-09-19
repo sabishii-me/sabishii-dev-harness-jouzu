@@ -115,5 +115,6 @@ export default function agentPresets(pi) {
         .pop();
       if (last && last.data && typeof last.data.asking === "boolean") review.on = last.data.asking;
     } catch {}
+    pi.appendEntry(FIELD, { asking: review.on });
   });
 }

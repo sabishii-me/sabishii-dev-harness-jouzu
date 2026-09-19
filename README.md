@@ -1,9 +1,9 @@
-# sabishii-me-harness-jouzu — the jouzu plugin
+# sabishii-dev-harness-jouzu — the jouzu plugin
 
 jouzu is pi-compatible; the adapter drives its own headless runtime (the `jouzu` package) the way the pi adapter drives pi's, and the same two extensions are placed for it.
 
 This repository is one harness plugin for
-[`sabishii-me-agent-hub`](https://github.com/sabishii-me/sabishii-me-agent-hub): the
+[`sabishii-dev-agent-hub`](https://github.com/sabishii-dev/sabishii-dev-agent-hub): the
 adapter that drives jouzu, its manifest, the harness-side extensions it installs,
 and (where the harness needs one) the preset definitions it applies. The hub's
 `docs/PROTOCOL.md` is the contract this adapter implements.
@@ -56,3 +56,13 @@ This repository is the plugin's home: edit here, commit, push. A deployment that
 composes plugins pins a commit (later a tag) of this repository and bumps the pointer
 there. The harness's own protocol quirks live in the adapter and belong to whoever
 tracks that harness.
+
+### Release identity and managed configuration
+
+The plugin release (manifest.version and package.json version) identifies adapter,
+extensions and installation declarations. runtime.package/version is a separate exact
+upstream pin. Adapter behavior changes OR a runtime pin change require a new plugin
+release and compatibility verification; upstream updates do not silently upgrade installs.
+0.1.2 is prepared locally, not published, with unchanged runtime pins.
+Managed configuration is application-owned. System configuration is not automatically
+imported. A future configuration-import provider requires explicit informed consent.

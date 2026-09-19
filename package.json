@@ -1,7 +1,7 @@
 {
-  "name": "sabishii-me-harness-jouzu",
-  "version": "0.1.0",
+  "name": "sabishii-dev-harness-jouzu",
+  "version": "0.1.2",
   "private": true,
-  "description": "The jouzu harness plugin for sabishii-me-agent-hub: adapter, manifest, extensions and presets.",
+  "description": "The jouzu harness plugin for sabishii-dev-agent-hub: adapter, manifest, extensions and presets.",
   "main": "jouzu-adapter.cjs"
 }

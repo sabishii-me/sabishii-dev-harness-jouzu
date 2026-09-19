@@ -28,14 +28,23 @@ const { spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { pathToFileURL } = require('node:url');
 
 // This plugin's own directory: the manifest's relative runtime paths are read
 // from here, so they mean "inside this plugin" regardless of where the host
 // happened to spawn the adapter from.
 const PLUGIN_DIR = __dirname;
 
+// Managed instances never borrow the terminal's native configuration home.
+// Apply once so catalogue, authentication and all child processes agree.
+if (process.env.AGENT_HUB_HARNESS_DIR) {
+  process.env.JOUZU_HOME = path.join(process.env.AGENT_HUB_HARNESS_DIR, 'jouzu-home');
+}
+
+
 // --- core-surface transcript (PROTOCOL §2): adapter-owned history truth ---
 const DATA_DIR = process.env.AGENT_HUB_HARNESS_DIR || null;
+
 let currentRef = null;
 let liveMessage = null;
 let configuredModel = null;
@@ -123,6 +132,127 @@ function resolvePi() {
   return { cmd, args: resolvedArgs };
 }
 
+// --- Shisa sign-in: jouzu's own account (capability `providers`) -------------
+// The device-code flow is the runtime's own (dist/shisa-link); this adapter only
+// hosts it where it can survive: a detached runner keeps polling after the
+// one-shot config-plane process that started it is gone. The credential is
+// persisted by the runtime into this harness's own agent dir (auth.json); the
+// hub never sees or stores it. Only non-secret progress (user code, URL, state)
+// is recorded, in an operation file under this harness's data dir.
+const SHISA_PROVIDER_ID = 'shisa';
+function opError(code, message) { return Object.assign(new Error(String(message)), { code }); }
+function opFail(code, message) { return { code: -32000, message: String(message).slice(0, 300), data: { code } }; }
+function shisaProvider() {
+  return { id: SHISA_PROVIDER_ID, displayName: 'Shisa', authKind: 'device-code', fields: [], supportsCustomEndpoint: false, supportsCustomModels: false };
+}
+function shisaRuntimeRoot() {
+  const r = (piRuntime = piRuntime || resolvePi());
+  const cli = r.args.length ? r.args[r.args.length - 1] : r.cmd;
+  return path.resolve(path.dirname(cli), '..');
+}
+async function shisaModules() {
+  const root = shisaRuntimeRoot();
+  const mod = (rel) => import(pathToFileURL(path.join(root, 'dist', rel)).href);
+  const [pathsMod, credsMod, logoutMod] = await Promise.all([mod('paths.js'), mod('shisa-link/credentials.js'), mod('shisa-link/logout.js')]);
+  return { paths: pathsMod.resolveJouzuPaths(), creds: credsMod, logout: logoutMod };
+}
+function shisaOpsDir() {
+  if (!DATA_DIR) die('AGENT_HUB_HARNESS_DIR not set: refusing to keep sign-in state outside the harness data dir');
+  const dir = path.join(DATA_DIR, 'shisa-auth');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+function shisaReadOp(id) {
+  if (!/^[a-f0-9]{16}$/.test(String(id || ''))) return null;   // ids are ours; never a path
+  try { return JSON.parse(fs.readFileSync(path.join(shisaOpsDir(), id + '.json'), 'utf8')); } catch { return null; }
+}
+function shisaFindPending() {
+  try {
+    for (const f of fs.readdirSync(shisaOpsDir())) {
+      if (!f.endsWith('.json')) continue;
+      const id = f.slice(0, -5);
+      const op = shisaReadOp(id);
+      if (op && op.state === 'pending' && op.userCode && (!op.expiresAt || op.expiresAt > Date.now())) return { id, op };
+    }
+  } catch { /* a vanishing file only means the flow ended */ }
+  return null;
+}
+async function shisaList() {
+  const { paths, creds } = await shisaModules();
+  const signedIn = !!creds.readShisaLoginToken(paths);
+  return { connections: [{ id: SHISA_PROVIDER_ID, providerId: SHISA_PROVIDER_ID, label: 'Shisa', status: signedIn ? 'connected' : 'needs-auth', revision: 0, secretConfigured: signedIn }] };
+}
+async function shisaStart(providerId) {
+  if (providerId !== SHISA_PROVIDER_ID) throw opError('unknown-provider', `no provider ${providerId}`);
+  // One live flow per harness: a reloaded UI polls the operation it already has
+  // instead of starting a second sign-in the person never asked for.
+  const existing = shisaFindPending();
+  if (existing) return { operationId: existing.id, next: { kind: 'device-code', userCode: existing.op.userCode, verifyUrl: existing.op.verifyUrl } };
+  const opId = crypto.randomBytes(8).toString('hex');
+  const opFile = path.join(shisaOpsDir(), opId + '.json');
+  const runner = path.join(PLUGIN_DIR, 'shisa-login-runner.mjs');
+  const child = spawn(process.execPath, [runner, opFile, shisaRuntimeRoot()], { windowsHide: true, stdio: 'ignore', detached: true, env: { ...process.env } });
+  child.unref();
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const op = shisaReadOp(opId);
+    if (op && op.userCode) return { operationId: opId, next: { kind: 'device-code', userCode: op.userCode, verifyUrl: op.verifyUrl } };
+    if (op && (op.state === 'failed' || op.state === 'expired')) throw opError('auth-start-failed', op.error || 'the sign-in request failed');
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  throw opError('auth-start-failed', 'the Shisa platform did not issue a device code in time');
+}
+function shisaPidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+async function shisaStatus(operationId) {
+  const op = shisaReadOp(operationId);
+  if (!op) return { status: 'failed', error: 'no such authorization operation' };
+  if (op.state === 'pending') {
+    if (op.expiresAt && Date.now() >= op.expiresAt) return { status: 'expired' };
+    // A dead runner that wrote no terminal state must not leave the caller
+    // polling forever: the flow it owned is gone and saying so is the answer.
+    if (op.pid && !shisaPidAlive(op.pid)) return { status: 'failed', error: 'the sign-in runner stopped unexpectedly' };
+    return { status: 'pending' };
+  }
+  if (op.state === 'approved') {
+    // The runner reported success only after persisting; verify the credential is
+    // actually there so "approved" is never a claim the storage does not support.
+    const { paths, creds } = await shisaModules();
+    if (!creds.readShisaLoginToken(paths)) return { status: 'failed', error: 'sign-in finished but no saved credential was found' };
+    return { status: 'approved' };
+  }
+  if (op.state === 'cancelled') return { status: 'cancelled' };
+  if (op.state === 'expired') return { status: 'expired' };
+  return { status: 'failed', ...(op.error ? { error: op.error } : {}) };
+}
+async function shisaCancel(operationId) {
+  const op = shisaReadOp(operationId);
+  if (op && op.state === 'pending') {
+    if (op.pid) { try { process.kill(op.pid, 'SIGTERM'); } catch { /* already gone */ } }
+    // Windows SIGTERM does not run the runner's handler (it terminates the
+    // process), so the terminal state is recorded here — but only while the
+    // operation is still pending: an approval that won the race stays approved.
+    const fresh = shisaReadOp(operationId);
+    if (fresh && fresh.state === 'pending') {
+      try { fs.writeFileSync(path.join(shisaOpsDir(), operationId + '.json'), JSON.stringify({ ...fresh, state: 'cancelled', finishedAt: new Date().toISOString() }), { mode: 0o600 }); } catch { /* the poller will see the dead pid */ }
+    }
+  }
+  return {};   // idempotent: cancelling a finished operation changes nothing
+}
+async function shisaLogout() {
+  const { paths, logout } = await shisaModules();
+  const result = await logout.logoutShisa({ paths, timeoutMs: 10000 });
+  if (!result.localCleared) throw opError('logout-incomplete', 'the saved Shisa credential could not be removed');
+  return {};
+}
+function shisaAnswer(id, promise) {
+  promise
+    .then((result) => { send({ jsonrpc: '2.0', id, result }); if (!pi) process.exit(0); })
+    .catch((e) => { send({ jsonrpc: '2.0', id, error: opFail(e && e.code ? e.code : 'connections-failed', e && e.message ? e.message : String(e)) }); if (!pi) process.exit(0); });
+}
+
 // --- bus framing -------------------------------------------------------------
 let buf = '';
 process.stdin.setEncoding('utf8');
@@ -144,27 +274,18 @@ let pi = null;            // ChildProcess
 let sid = null;           // bus session id
 let nextBusId = 1;        // ids the adapter picks when talking to pi
 const pendingPi = new Map();     // pi response id → resolver
-// pi's own level names, used only to NAME the levels a model declared. The core
-// reports where a list came from (thinkingLevelsSource); an adapter's job is to
-// say what the harness said, not to decide which levels are usable. A model
-// whose declaration carries no level map has declared nothing, so nothing is
-// reported for it and the core answers 'default' — the harness still has a
-// default, the adapter simply does not know it and must not invent one.
-const PI_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
-
-// A model's DECLARED levels, per its own thinkingLevelMap: a mapped null removes
-// a level, `xhigh`/`max` exist only when the map names them, everything else is
-// offered unless removed. No map at all = nothing declared = null (absence).
-function declaredThinkingLevels(m) {
-  if (m.reasoning !== true) return null;
+// The thinking levels a model's configuration states, read as data and passed on
+// verbatim: an explicit `thinkingLevels` list, or the names an older pi-style
+// `thinkingLevelMap` maps (a null value removes that name). No list = the config
+// says nothing, which is not the same as an empty list. Nothing is inferred from
+// either shape: a harness's own rules about what it can use are the harness's
+// business, not this adapter's.
+function configThinkingLevels(m) {
+  if (!m || typeof m !== 'object') return null;
+  if (Array.isArray(m.thinkingLevels)) return m.thinkingLevels.filter((l) => typeof l === 'string' && l);
   const map = m.thinkingLevelMap;
-  if (!map || typeof map !== 'object') return null;
-  return PI_THINKING_LEVELS.filter((level) => {
-    const mapped = map[level];
-    if (mapped === null) return false;
-    if (level === 'xhigh' || level === 'max') return mapped !== undefined;
-    return true;
-  });
+  if (map && typeof map === 'object') return Object.keys(map).filter((level) => map[level] !== null && map[level] !== undefined);
+  return null;
 }
 const pendingApprovals = new Map(); // pi extension_ui_request id → resolver
 const pendingQuestions = new Map(); // pi extension_ui_request id → resolver (select)
@@ -385,17 +506,13 @@ function buildInjectedDir() {
 
 // Add the injected provider into the private AGENT dir's models.json. apiKey is
 // an env reference; the value rides in the pi subprocess env only.
-// pi's thinkingLevelMap is a mapping, not a list: a level appears only if the
-// map names the level pi would send for it. The declared efforts are the levels
-// the model accepts, so each one maps to itself and the rest stay absent — a
-// model that declares no effort gets no map, which is what makes pi treat it as
-// having no levels to offer rather than offering the wrong ones.
+// A declaration's levels become the harness's own level map, mechanically: each
+// declared name maps to itself. What that map means to the harness (and what it
+// accepts beyond it) is the harness's own rule; the adapter only copies data.
 function thinkingLevelMapFor(decl) {
-  const efforts = decl && decl.reasoning && Array.isArray(decl.reasoning.efforts) ? decl.reasoning.efforts : null;
-  if (!efforts || !efforts.length) return null;
-  const map = {};
-  for (const level of efforts) map[level] = level;
-  return map;
+  const levels = Array.isArray(decl?.thinkingLevels) ? decl.thinkingLevels.filter((l) => typeof l === 'string' && l) : null;
+  if (!levels || !levels.length) return null;
+  return Object.fromEntries(levels.map((level) => [level, level]));
 }
 
 function applyInjectedProvider(dir, modelIds) {
@@ -464,9 +581,24 @@ function startPi(resumeRef) {
   // Run jouzu in the user project dir (AGENT_HUB_CWD) so tools act on the project.
   const cwd = process.env.AGENT_HUB_CWD || undefined;
   harnessUp = null; harnessUpResolve = null;   // a new child is a new readiness question
-  pi = spawn(piRuntime.cmd, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'inherit'], env, ...(cwd ? { cwd } : {}) });
-  // pi's stderr (jouzu runtime) is inherited from this adapter, so the core logs it; nothing
-  // to drain here (child.stderr is null under 'inherit').
+  pi = spawn(piRuntime.cmd, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env, ...(cwd ? { cwd } : {}) });
+  // The harness's stderr is READ here, not inherited: its lines are what explains an exit,
+  // and without a prefix the reader cannot tell which process said what. The last few are
+  // kept so the exit message can carry a reason instead of a code.
+  const harnessTail = [];
+  pi.stderr.setEncoding('utf8');
+  let perr = '';
+  pi.stderr.on('data', (chunk) => {
+    perr += chunk;
+    let j;
+    while ((j = perr.indexOf(String.fromCharCode(10))) >= 0) {
+      const line = perr.slice(0, j).trimEnd(); perr = perr.slice(j + 1);
+      if (!line.trim()) continue;
+      harnessTail.push(line);
+      if (harnessTail.length > 20) harnessTail.shift();
+      process.stderr.write('[jouzu-harness] ' + line + String.fromCharCode(10));
+    }
+  });
   let pbuf = '';
   pi.stdout.setEncoding('utf8');
   pi.stdout.on('data', (d) => {
@@ -488,7 +620,8 @@ function startPi(resumeRef) {
     // EOF, not a dangling adapter.
     for (const [, resolve] of pendingPi) resolve(null);
     pendingPi.clear();
-    if (sid) process.stderr.write('[jouzu-adapter] harness exited code=' + code + '\n');
+    if (sid) process.stderr.write('[jouzu-adapter] harness exited code=' + code + String.fromCharCode(10));
+    if (harnessTail.length) process.stderr.write('[jouzu-adapter] the harness said:' + String.fromCharCode(10) + harnessTail.join(String.fromCharCode(10)) + String.fromCharCode(10));
     process.exit(code == null ? 1 : 0);
   });
   return ref;
@@ -513,6 +646,15 @@ function handlePiMessage(msg) {
   }
   if (msg.type === 'extension_ui_request') {
     const reqId = msg.id;
+    if (msg.method === 'notify') {
+      const message = msg.message ?? msg.params?.message;
+      if (typeof message === 'string') send({ jsonrpc: '2.0', method: 'event', params: { sid, data: {
+        type: 'notification', message: message.slice(0, 32768),
+        level: ['info', 'warning', 'error'].includes(msg.notifyType) ? msg.notifyType : 'info',
+      } } });
+      return;
+    }
+
     if (process.env.AGENT_HUB_DIALOG_TRACE) process.stderr.write(`[jouzu-adapter] dialog method=${msg.method} id=${reqId} title=${JSON.stringify(msg.title ?? msg.params?.title ?? '')}\n`);
     const structuredReview = msg.method === 'input' && (msg.title ?? msg.params?.title) === 'tool-review/v2';
     if (msg.method === 'confirm' || structuredReview) {
@@ -893,7 +1035,28 @@ function handleBusMessage(msg) {
         send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'session/prompt requires clientMessageId (core surface)' } });
         return;
       }
-      appendTranscript({ id: params.clientMessageId, role: 'user', text: params.message, complete: true });
+      // These native control commands complete at their handler's RPC response,
+      // not at a model turn_end. Verify registration so they never become a
+      // provider prompt when the extension is missing. Other commands may launch
+      // model work and are deliberately not classified by their leading slash.
+      const control = typeof params.message === 'string' && /^\/(flow|workflow)(?:\s|$)/.exec(params.message);
+      if (control && !(params.images?.length)) {
+        (async () => {
+          const catalog = await piRequest({ type: 'get_commands' });
+          if (!catalog?.success || !catalog.data?.commands?.some(c => c.name === control[1])) {
+            throw new Error(`native command /${control[1]} is unavailable; no model request was made`);
+          }
+          // Native controls are not model conversation messages. Their feedback
+          // is session-scoped; do not add an unmatched row to native history.
+          const response = await piRequest({ type: 'prompt', message: params.message });
+          if (!response?.success) throw new Error(JSON.stringify(response?.error ?? 'native control failed'));
+          // Completion means the control handler returned, not that a model ran.
+          send({ jsonrpc: '2.0', method: 'event', params: { sid, data: { type: 'turn_end', status: 'ok' } } });
+          send({ jsonrpc: '2.0', id, result: {} });
+        })().catch(error => send({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message } }));
+        return;
+      }
+      appendTranscript({ id: params.clientMessageId, role: 'user', source: params.source || 'user', text: params.message, complete: true });
       // Do NOT arm the new turn yet: a stale turn_end from a just-aborted turn
       // can still arrive. pi cannot emit the new turn's turn_end before it
       // acknowledges the prompt, so we arm (turnActive=true) only after the ack
@@ -1008,11 +1171,28 @@ function handleBusMessage(msg) {
       const reply = (message) => { if (!replied) { replied = true; send(message); } };
       let pendingCount = 1; // synchronous scheduling owns the first slot
       const applied = {};
+      let applyThinkingAfterModel = null;
       const settle = () => {
         pendingCount -= 1;
         if (pendingCount > 0) return;
         if (applied.preset === undefined && presetId !== undefined && activePresetId !== null) applied.preset = activePresetId;
-        reply({ jsonrpc: '2.0', id, result: Object.keys(applied).length ? { applied, requires: 'none' } : {} });
+        if (replied) return;
+        // Snapshot actual configuration even when caller omitted a model/level.
+        piRequest({ type: 'get_state' }).then(state => {
+          if (state?.success !== true) throw new Error('cannot read effective configuration');
+          const actual = state.data;
+          if (actual.model) { applied.model = actual.model.id; applied.connectionId = actual.model.provider; }
+          applied.thinkingLevel = typeof actual.thinkingLevel === 'string' ? actual.thinkingLevel : null;
+          return piRequest({ type: 'get_entries' });
+        }).then(result => {
+          if (result?.success !== true) throw new Error('cannot read session policy');
+          const entries = result.data?.entries || [];
+          const planEntry = entries.filter(e => e.customType === 'plan/mode').at(-1);
+          const reviewEntry = entries.filter(e => e.customType === 'hub-review/state').at(-1);
+          if (typeof planEntry?.data?.active === 'boolean') applied.plan = planEntry.data.active;
+          if (typeof reviewEntry?.data?.asking === 'boolean') applied.review = reviewEntry.data.asking;
+          reply({ jsonrpc: '2.0', id, result: { applied, requires: 'none' } });
+        }).catch(error => reply({ jsonrpc: '2.0', id, error: { code: -32000, message: error.message } }));
       };
 
       if (presetId !== undefined) {
@@ -1105,26 +1285,31 @@ function handleBusMessage(msg) {
         // The level is the harness's own; set it through pi's rpc and report only
         // what pi confirmed. A rejected or unanswered set is never success.
         const reject = (message) => reply({ jsonrpc: '2.0', id, error: { code: -32000, message, data: { code: 'thinking-level-not-applied' } } });
-        if (!PI_THINKING_LEVELS.includes(thinkingLevel)) { reject('unsupported thinking level: ' + thinkingLevel); return; }
         if (!(pi && !turnActive)) { reject('cannot set thinking level: no idle harness'); return; }
         pendingCount += 1;
         let done = false;
         let timer = null;
         const giveUp = (message) => { if (done) return; done = true; if (timer) clearTimeout(timer); reject(message); };
-        harnessUpProof(120000)
+        const applyThinking = () => harnessUpProof(120000)
           .then(() => {
             if (done) return;
             timer = setTimeout(() => giveUp('set_thinking_level did not confirm before its deadline'), 30000);
-            return piRequest({ type: 'set_thinking_level', thinkingLevel });
+            return piRequest({ type: 'set_thinking_level', level: thinkingLevel });
           })
           .then((r) => {
             if (done) return;
             if (!r || r.success !== true) { giveUp('set_thinking_level was rejected'); return; }
-            done = true; clearTimeout(timer);
-            applied.thinkingLevel = thinkingLevel;
-            settle();
+            return piRequest({ type: 'get_state' }).then(state => {
+              if (done) return;
+              const actual = state?.success === true ? state.data?.thinkingLevel : undefined;
+              if (actual !== thinkingLevel) { giveUp('thinking level was not applied: requested ' + thinkingLevel + ', observed ' + actual); return; }
+              done = true; clearTimeout(timer);
+              applied.thinkingLevel = actual;
+              settle();
+            });
           })
           .catch((e) => giveUp(e && e.readiness ? `the harness did not come up: ${e.message}` : 'cannot set thinking level: ' + e.message));
+        if (model !== undefined) applyThinkingAfterModel = applyThinking; else applyThinking();
       }
 
       if (model !== undefined) {
@@ -1176,6 +1361,7 @@ function handleBusMessage(msg) {
               if (connectionId) applied.modelProviderId = connectionId;
               applied.model = hit.id;
               applied.configRevision = null;
+              if (applyThinkingAfterModel) applyThinkingAfterModel();
               settle();
             })
             .catch((e) => rejectModel(e && e.readiness ? `the harness did not come up: ${e.message}` : 'cannot set model: ' + e.message));
@@ -1341,6 +1527,24 @@ function handleBusMessage(msg) {
       }).catch((e) => send({ jsonrpc: '2.0', id, error: { code: -32000, message: `stats failed: ${e.message}` } }));
       return;
     }
+    case 'history/read': {
+      // Read through native persistence without starting a harness or configuring
+      // a provider. Only the hub supplies the existing session reference.
+      try {
+        if (typeof params.ref !== 'string' || !fs.existsSync(params.ref)) throw new Error('session history reference unavailable');
+        const entries = enrichHistory(params.ref, loadTranscript(params.ref));
+        let end = entries.length;
+        if (params.beforeId != null) {
+          end = entries.findIndex(e => e.id === params.beforeId);
+          if (end < 0) throw new Error('unknown beforeId: ' + params.beforeId);
+        }
+        const start = Math.max(0, end - Math.max(1, Number(params.limit) || 100));
+        send({jsonrpc:'2.0',id,result:{messages:entries.slice(start,end),hasMore:start>0}});
+      } catch (e) {
+        send({jsonrpc:'2.0',id,error:{code:-32000,message:e.message,data:{code:'history_unavailable'}}});
+      }
+      return;
+    }
     case 'history/page': {
       if (!currentRef) {
         send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'no session open' } });
@@ -1363,7 +1567,7 @@ function handleBusMessage(msg) {
       const start = Math.max(0, end - limit);
       const page = entries.slice(start, end).map((e) => ({ ...e, complete: true }));
       send({ jsonrpc: '2.0', id, result: { messages: page, hasMore: start > 0 } });
-      }).catch(e => send({ jsonrpc: '2.0', id, error: { code: -32000, message: e.message } }));
+      }).catch(e => send({ jsonrpc: '2.0', id, error: { code: -32000, message: e.message, data: { code: 'history_unavailable' } } }));
       return;
     }
     // runtime/prepare: materialise the harness this plugin drives. The manifest pins it
@@ -1442,6 +1646,42 @@ function handleBusMessage(msg) {
       } });
       return;
     }
+    // Shisa sign-in (capability `providers`): schema/list/delete plus the
+    // auth operation lifecycle. There are no editable fields — the account is
+    // this harness's own, authorized with a device code, never a pasted key.
+    case 'connections/schema': {
+      shisaAnswer(id, Promise.resolve({ providers: [shisaProvider()] }));
+      return;
+    }
+    case 'connections/list': {
+      shisaAnswer(id, shisaList());
+      return;
+    }
+    case 'connections/validate': {
+      shisaAnswer(id, Promise.resolve({ ok: false, fieldErrors: [{ field: 'auth', message: 'Shisa signs in with a device code; there is no draft to test.' }] }));
+      return;
+    }
+    case 'connections/save': {
+      send({ jsonrpc: '2.0', id, error: opFail('unsupported-for-provider', 'Shisa signs in with a device code; there are no fields to save') });
+      if (!pi) process.exit(0);
+      return;
+    }
+    case 'connections/delete': {
+      shisaAnswer(id, shisaLogout());
+      return;
+    }
+    case 'auth/start': {
+      shisaAnswer(id, shisaStart(params.providerId));
+      return;
+    }
+    case 'auth/status': {
+      shisaAnswer(id, shisaStatus(params.operationId));
+      return;
+    }
+    case 'auth/cancel': {
+      shisaAnswer(id, shisaCancel(params.operationId));
+      return;
+    }
     default:
       send({ jsonrpc: '2.0', id, error: { code: -32601, message: `unknown plugin method ${method}` } });
   }
@@ -1455,20 +1695,10 @@ function readJsonFile(path) {
   try { return JSON.parse(fs.readFileSync(path, 'utf8')); } catch { return null; }
 }
 
+// This adapter's managed configuration is also used by auth and runtime startup.
 function jouzuAgentDir() {
-  const env = process.env;
-  const home = process.env.USERPROFILE || process.env.HOME || '';
-  const override = process.env.JOUZU_HOME;
-  if (override && override.trim()) return path.join(override, 'agent');
-  if (process.platform === 'win32') {
-    const roaming = env.APPDATA || path.join(home, 'AppData', 'Roaming');
-    return path.join(roaming, 'Jouzu', 'agent');
-  }
-  if (process.platform === 'darwin') {
-    return path.join(home, 'Library', 'Application Support', 'Jouzu', 'agent');
-  }
-  const cfg = env.XDG_CONFIG_HOME || path.join(home, '.config');
-  return path.join(cfg, 'jouzu', 'agent');
+  if (!process.env.AGENT_HUB_HARNESS_DIR) throw new Error('AGENT_HUB_HARNESS_DIR is required for managed configuration');
+  return path.join(process.env.JOUZU_HOME, 'agent');
 }
 
 function resolveTemplate(value) {
@@ -1519,10 +1749,8 @@ function scanModels() {
       name: typeof m.name === 'string' && m.name ? m.name : m.id,
       supportsImages: m.supportsImages !== false,
       reasoning: m.reasoning === true,
-      // Only what the model declared. A model that reasons without naming its
-      // levels reports none, so the core answers 'default' rather than a level
-      // set the adapter made up.
-      ...(declaredThinkingLevels(m) ? { thinkingLevels: declaredThinkingLevels(m) } : {}),
+      // Only what the model's configuration states, verbatim.
+      ...(configThinkingLevels(m) ? { thinkingLevels: configThinkingLevels(m) } : {}),
       authStatus: 'authenticated',
       configured: provider in configured,
     });
@@ -1551,7 +1779,8 @@ function managedModels(providers) {
     const provider = INJECT_PREFIX + row.id;
     for (const m of Array.isArray(row.models) ? row.models : []) {
       if (!m || typeof m.id !== 'string' || !m.id) continue;
-      const efforts = m.reasoning && Array.isArray(m.reasoning.efforts) ? m.reasoning.efforts : null;
+      // The levels the hub's declaration states, passed on verbatim.
+      const levels = Array.isArray(m.thinkingLevels) ? m.thinkingLevels.filter((l) => typeof l === 'string' && l) : null;
       out[provider + '::' + m.id] = {
         connectionId: provider,
         provider,
@@ -1561,8 +1790,7 @@ function managedModels(providers) {
         // The hub owns the token, so the hub answers whether the model can run.
         available: row.hasCredential === true,
         ...(row.hasCredential === true ? {} : { unavailableReason: 'needs-auth' }),
-        reasoning: Boolean(efforts && efforts.length),
-        ...(efforts && efforts.length ? { thinkingLevels: efforts } : {}),
+        ...(levels ? { thinkingLevels: levels } : {}),
         ...(Array.isArray(m.input) && m.input.length ? { input: m.input } : {}),
         ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
         ...(m.maxTokens ? { maxTokens: m.maxTokens } : {}),

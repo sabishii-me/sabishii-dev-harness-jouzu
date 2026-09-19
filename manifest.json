@@ -1,5 +1,6 @@
 {
   "id": "jouzu",
+  "version": "0.1.2",
   "protocol": 0,
   "command": [
     "node",
@@ -19,6 +20,7 @@
   ],
   "capabilities": [
     "models",
+    "providers",
     "runtime",
     "presets",
     "plan",
@@ -27,6 +29,7 @@
     "stats",
     "compact",
     "rename",
-    "skills"
+    "skills",
+    "history-readonly"
   ]
 }

@@ -24,14 +24,29 @@ function enrichHistory(ref, transcript) {
   const branch = nativeMessages(ref);
   const native = branch.filter(e=>['user','assistant'].includes(e.message.role));
   const textOf = m => (m.content || []).filter(p=>p.type==='text').map(p=>p.text || '').join('');
-  if (native.length !== transcript.length || !native.every((e,i)=>e.message.role===transcript[i].role && textOf(e.message)===(transcript[i].text || ''))) {
-    // New records with explicit native mapping can still be enriched safely.
-    if (!transcript.every(e=>e.nativeId)) throw new Error('history alignment unresolved; refusing text-only replacement');
+  const matches = (entry, record) => record.nativeId ? entry.id === record.nativeId
+    : entry.message.role === record.role && textOf(entry.message) === (record.text || '');
+  // A harness may insert its own user-role continuations. Align the adapter's
+  // transcript as a subsequence, but accept only an unambiguous alignment.
+  const earliest = [], latest = []; let cursor = 0;
+  for (const record of transcript) {
+    while (cursor < native.length && !matches(native[cursor], record)) cursor++;
+    if (cursor === native.length) throw new Error('history alignment unresolved; transcript message missing');
+    earliest.push(cursor++);
   }
+  cursor = native.length - 1;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    while (cursor >= 0 && !matches(native[cursor], transcript[i])) cursor--;
+    if (cursor < 0) throw new Error('history alignment unresolved; transcript message missing');
+    latest[i] = cursor--;
+  }
+  if (earliest.some((index,i) => index !== latest[i])) throw new Error('history alignment unresolved; ambiguous native mapping');
+  const mapped = new Map(earliest.map((index,i)=>[index, transcript[i]]));
   const results = new Map(branch.filter(e=>e.message.role==='toolResult').map(e=>[e.message.toolCallId,e.message]));
-  return transcript.map((record,index)=>{
-    const entry = record.nativeId ? native.find(e=>e.id===record.nativeId) : native[index];
-    if (!entry || entry.message.role!==record.role) throw new Error('native history message missing');
+  return native.map((entry,index)=>{
+    // Preserve known public IDs; expose additional native records by their own
+    // stable IDs, not guessed positions or fabricated replacement messages.
+    const record = mapped.get(index) || { id: entry.id, role: entry.message.role, text: textOf(entry.message), complete: true, source: 'harness' };
     const parts=entry.message.content || [];
     return {...record, nativeId:entry.id, createdAt:entry.timestamp,
       reasoning:parts.filter(p=>p.type==='thinking').map(p=>p.thinking || '').join('\n'),
